@@ -1083,6 +1083,153 @@ int test_reject_401_bad(struct context *ctx)
 
 /* ---------------------------------------------------------------------- */
 
+/* Reject call with 401, rotating nonce each time (no stale=true).
+ *
+ * Without the nua_client.c fix for bug #1685245 + nonce rotation,
+ * the client would auto-retry bad credentials up to retry_count times
+ * because auc_challenge() reports "updated" on every nonce change,
+ * hiding the bad-credentials condition from the invalid-detection logic.
+ *
+ * With the fix, the client sees two INVITEs on the server side:
+ *   1. Initial INVITE (no auth)  -> 401 with nonce_1
+ *   2. INVITE + auth(nonce_1)    -> 401 with nonce_2, no auto-retry
+ *
+ A  reject-401-bad-nonce  B
+ |                        |
+ |-------INVITE---------->|
+ |<----100 Trying---------|
+ |<--------401 (nonce_1)--|
+ |---------ACK----------->|
+ |                        |
+ |-------INVITE+auth----->|
+ |<----100 Trying---------|
+ |<--------401 (nonce_2)--|
+ |---------ACK----------->|
+*/
+
+int reject_401_bad_nonce(CONDITION_PARAMS)
+{
+  if (!(check_handle(ep, call, nh, SIP_500_INTERNAL_SERVER_ERROR)))
+    return 0;
+
+  save_event_in_list(ctx, event, ep, call);
+
+  switch (callstate(tags)) {
+  case nua_callstate_received:
+    {
+      /* Rotate nonce on every challenge — never send stale=true */
+      char auth[256];
+      ep->flags.n++;
+      snprintf(auth, sizeof auth,
+	       "Digest realm=\"No hope\", "
+	       "nonce=\"rotating_%u\", "
+	       "algorithm=MD5, "
+	       "qop=\"auth\"",
+	       ep->flags.n);
+      RESPOND(ep, call, nh, SIP_401_UNAUTHORIZED,
+	      SIPTAG_WWW_AUTHENTICATE_STR(auth),
+	      TAG_END());
+    }
+    return 0;
+  case nua_callstate_terminated:
+    if (call)
+      nua_handle_destroy(call->nh), call->nh = NULL;
+    if (ep->flags.bit0)
+      return 1;
+    ep->flags.bit0 = 1;
+    return 0;
+  default:
+    return 0;
+  }
+}
+
+int test_reject_401_bad_nonce(struct context *ctx)
+{
+  BEGIN();
+
+  struct endpoint *a = &ctx->a, *b = &ctx->b;
+  struct call *a_call = a->call, *b_call = b->call;
+  struct event const *e;
+  sip_t const *sip;
+
+  if (print_headings)
+    printf("TEST NUA-4.6.3: bad credentials with rotating nonce\n");
+
+  a_call->sdp = "m=audio 5008 RTP/AVP 8";
+  b->flags.n = 0;
+  b->flags.bit0 = 0;
+
+  TEST_1(a_call->nh = nua_handle(a->nua, a_call, SIPTAG_TO(b->to), TAG_END()));
+  INVITE(a, a_call, a_call->nh,
+	 TAG_IF(!ctx->proxy_tests, NUTAG_URL(b->contact->m_url)),
+	 SIPTAG_SUBJECT_STR("reject-401-bad-nonce"),
+	 SOATAG_USER_SDP_STR(a_call->sdp),
+	 TAG_END());
+
+  run_ab_until(ctx, -1, authenticate_bad, -1, reject_401_bad_nonce);
+
+  /*
+   Client transitions — same as test_reject_401_bad:
+   initial INVITE -> 401 -> authenticate -> INVITE+auth -> 401 -> give up
+  */
+  TEST_1(e = a->events->head); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_calling); /* CALLING */
+  TEST_1(is_offer_sent(e->data->e_tags));
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_r_invite);
+  TEST(sip_object(e->data->e_msg)->sip_status->st_status, 401);
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_calling); /* CALLING */
+  TEST_1(is_offer_sent(e->data->e_tags));
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_r_invite);
+  TEST(sip_object(e->data->e_msg)->sip_status->st_status, 401);
+  /* After second 401 with different nonce, client must not auto-retry —
+   * nua_authenticate() fails because credentials were cleared */
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_r_invite);
+  TEST(e->data->e_status, 904);
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_terminated); /* TERMINATED */
+  TEST_1(!e->next);
+
+  free_events_in_list(ctx, a->events);
+
+  /*
+   Server must see exactly 2 INVITEs (not 3+ from auto-retry loop):
+     1. Initial INVITE (no auth)
+     2. INVITE with auth credentials
+  */
+  TEST_1(e = b->events->head); TEST_E(e->data->e_event, nua_i_invite);
+  TEST_1(sip = sip_object(e->data->e_msg));
+  TEST(e->data->e_status, 100);
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_received); /* RECEIVED */
+  TEST_1(is_offer_recv(e->data->e_tags));
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_terminated); /* TERMINATED */
+
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_invite);
+  TEST_1(sip = sip_object(e->data->e_msg));
+  TEST(e->data->e_status, 100);
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_received); /* RECEIVED */
+  TEST_1(is_offer_recv(e->data->e_tags));
+  TEST_1(e = e->next); TEST_E(e->data->e_event, nua_i_state);
+  TEST(callstate(e->data->e_tags), nua_callstate_terminated); /* TERMINATED */
+  TEST_1(!e->next);
+
+  free_events_in_list(ctx, b->events);
+
+  nua_handle_destroy(a_call->nh), a_call->nh = NULL;
+  nua_handle_destroy(b_call->nh), b_call->nh = NULL;
+
+  if (print_headings)
+    printf("TEST NUA-4.6.3: PASSED\n");
+
+  END();
+}
+
+
+/* ---------------------------------------------------------------------- */
+
 int test_mime_negotiation(struct context *ctx)
 {
   BEGIN();
@@ -1678,6 +1825,7 @@ int test_rejects(struct context *ctx)
 {
   return
     test_reject_401_bad(ctx) ||
+    test_reject_401_bad_nonce(ctx) ||
     test_reject_a(ctx) ||
     test_reject_b(ctx) ||
     test_reject_302(ctx) ||

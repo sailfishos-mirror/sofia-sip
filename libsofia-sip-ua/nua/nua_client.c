@@ -32,6 +32,14 @@
 
 #include "config.h"
 
+/* Set to 1 to prevent auto-retry of credentials when the server
+ * challenges with a new nonce but without stale=true (bug #1685245).
+ * When 0, the old behavior is preserved: nonce rotation with bad
+ * credentials causes up to retry_count wasted round-trips. */
+#ifndef NUA_AUTH_FIX_1685245_NONCE_ROTATE
+#define NUA_AUTH_FIX_1685245_NONCE_ROTATE 0
+#endif
+
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1326,16 +1334,41 @@ int nua_base_client_check_restart(nua_client_request_t *cr,
 			    sip_proxy_authorization_class);
 
     if (server >= 0 && proxy >= 0) {
-      int invalid = cr->cr_challenged && server + proxy == 0;
+      int already_challenged = cr->cr_challenged;
+      int invalid = already_challenged && server + proxy == 0;
 
       cr->cr_challenged = 1;
 
       if (invalid) {
-		  /* Bad username/password */
+		  /* Bad username/password (same nonce re-challenged) */
 		  SU_DEBUG_7(("nua(%p): bad credentials, clearing them\n", (void *)nh));
 		  auc_clear_credentials(&nh->nh_auth, NULL, NULL);
       } else if (auc_has_authorization(&nh->nh_auth)) {
-		  return nua_client_restart(cr, 100, "Request Authorized by Cache");
+#if NUA_AUTH_FIX_1685245_NONCE_ROTATE
+		  /* Only auto-retry if this is the first challenge or server
+		   * explicitly indicated stale nonce.  When cr_challenged is
+		   * already set and stale is not true, the server is rejecting
+		   * our credentials even though the nonce changed -- do not
+		   * loop, let the application re-authenticate (bug #1685245). */
+		  int stale_present = 0;
+		  msg_auth_t const *au;
+
+		  for (au = sip->sip_www_authenticate; au; au = au->au_next) {
+		      char const *s = msg_header_find_param(au->au_common, "stale=");
+		      if (s && su_casematch(s, "true"))
+			  { stale_present = 1; break; }
+		  }
+		  if (!stale_present) {
+		      for (au = sip->sip_proxy_authenticate; au; au = au->au_next) {
+			  char const *s = msg_header_find_param(au->au_common, "stale=");
+			  if (s && su_casematch(s, "true"))
+			      { stale_present = 1; break; }
+		      }
+		  }
+
+		  if (!already_challenged || stale_present)
+#endif
+		      return nua_client_restart(cr, 100, "Request Authorized by Cache");
 	  }
 
       orq = cr->cr_orq, cr->cr_orq = NULL;
